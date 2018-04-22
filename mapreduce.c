@@ -3,6 +3,7 @@
 #include "mapreduce.h"
 #include<string.h>
 #include<pthread.h>
+#include <unistd.h>
 
 /////////////////////////////////////////////////////////////////////////////////
 //Global Variables
@@ -17,6 +18,7 @@ pthread_mutex_t filelock=PTHREAD_MUTEX_INITIALIZER;
 int MAPDONE=0;
 int fileNumber=0;
 int current_file=1;
+int current_partition=0;
 int map_thread=0;
 pthread_mutex_t *partitionlock;
 
@@ -32,9 +34,7 @@ struct node{
     struct node *next;
     struct subnode *subnode;
     struct subnode *current;
-    //get next helpers
-    //int current;
-    //int size;
+    int size;
 };
 
 //Main Hash Table
@@ -51,7 +51,6 @@ struct subnode{
     struct subnode* next;
 };
 
-//struct table *t; //Hash Table Variable
 
 //Function used to instantiate the table
 struct table *createTable(int size){
@@ -59,14 +58,11 @@ struct table *createTable(int size){
     t->size = size;
     t->list = malloc(sizeof(struct node*)*size);
     t->locks=malloc(sizeof(pthread_mutex_t)*size);
-    if(t->locks == NULL){
-        free(t);
-        return NULL;
-    }
     int i;
     for(i=0;i<size;i++){
         t->list[i] = NULL;
-        pthread_mutex_init(&(t->locks[i]), NULL);
+        if(pthread_mutex_init(&(t->locks[i]), NULL)!=0)
+            printf("Locks init failed\n");
     }
     return t;
 }
@@ -83,7 +79,6 @@ hash(char *str)
     }
     hash=hash%TABLE_SIZE;
     return hash;
-    //return 1;
 }
 
 
@@ -91,31 +86,28 @@ hash(char *str)
 void insert(struct table *t,char* key,char* val){
     if(strcmp(key,"")==0)
        return;
-    long long pos=hash(key);
-    struct node *list = t->list[pos];
-    struct node *temp = list;
+    int pos=hash(key);
+
     pthread_mutex_t *lock = t->locks + pos;
     struct subnode *newSubNode=malloc(sizeof(struct subnode));
     newSubNode->val=strdup(val);
     newSubNode->next=NULL;
     pthread_mutex_lock(lock);
-    int i=0;
+    struct node *list = t->list[pos];
+    struct node *temp = list;
     while(temp){
         if(strcmp(temp->key,key)==0){
-            printf("i: %d, key: %s\n",i,key);
             struct subnode *sublist = temp->subnode;
             newSubNode->next=sublist;
-            //temp->size++;
+            temp->size++;
             temp->subnode = newSubNode;
-            temp->current=temp->subnode;
+            temp->current = newSubNode;
             pthread_mutex_unlock(lock);
             return;
         }
         
         temp = temp->next;
-        i++;
     }
-    //printf("Key %s\n",key);
     struct node *newNode = malloc(sizeof(struct node));
     temp=list;
     
@@ -123,7 +115,6 @@ void insert(struct table *t,char* key,char* val){
     
     newNode->key = strdup(key);
     newNode->subnode=newSubNode;
-    //newNode->size=1;
     newNode->current=newNode->subnode;
     if(temp==NULL){
         t->list[pos]= newNode;
@@ -146,11 +137,13 @@ void insert(struct table *t,char* key,char* val){
             newNode->next=temp;
             t->list[pos]=newNode;
             pthread_mutex_unlock(lock);
+            
             return;
         }
         newNode->next=temp;
         prev->next=newNode;
         pthread_mutex_unlock(lock);
+        
         return;
     }
     
@@ -182,28 +175,18 @@ int compareKey(const void *s1, const void *s2)
 
 
 //Getter function that returns the next key in a subnode list.
-char* get_next(char* key, int partition_number)
+char* get_next(char* key, int partition_num)
 {
     if(strcmp(key,"")==0)
        return NULL;
-    long partitionNumber;
     int found=0;
-    if(partitioner!=NULL){
-        partitionNumber = partitioner(key,partition_number);
-    }
-    else{
-        partitionNumber= MR_DefaultHashPartition(key,partition_number);
-    }
-    
-    pthread_mutex_lock(&partitionlock[partition_number]);
-    struct table *t=p[partitionNumber];
+    struct table *t=p[partition_num];
     
     long long pos=hash(key);
     struct node *list = t->list[pos];
     struct node *temp = list;
     while(temp){
         if(strcmp(temp->key,key)==0){
-            //printf("Here\n");
             found=1;
             break;
          }
@@ -212,20 +195,13 @@ char* get_next(char* key, int partition_number)
          }       
     }
     if(found==0){ //key not found
-        pthread_mutex_unlock(&partitionlock[partition_number]);
         return NULL;
      }
-    
-    //struct subnode *sublist=temp->subnode;
     struct subnode *addr = temp->current;
     if(addr==NULL){
-         pthread_mutex_unlock(&partitionlock[partition_number]);
         return NULL;
       }
-    //printf("Key: %s\n",key);
-     //char* str=strdup(addr->val);
      temp->current=addr->next;
-      pthread_mutex_unlock(&partitionlock[partition_number]);
      return addr->val;
 }
 
@@ -244,39 +220,47 @@ void* callMap(char *fileName){
     return NULL;
 }
 
-void* callReduce(void *key){
-    printf("In callreduce\n");
-    long long partitionNumber;
-    if(partitioner!=NULL){
-        partitionNumber = partitioner(key,partition_number);
-    }
-    else{
-        partitionNumber= MR_DefaultHashPartition(key,partition_number);
-    }
-    partitionNumber=10;
-    char *string=(char*)key;
-    reducer(string,get_next,partitionNumber);
-    return NULL;
+
+
+
+void reduceHelper(int i){
+    if(p[i]==NULL)
+        return;
+    struct table* tempTable=p[i];
+    for(int j=0;j<TABLE_SIZE;j++){
+        if(tempTable->list[j] ==NULL)
+            continue;
+        struct node* tempNode=tempTable->list[j];
+        while(tempNode){
+            reducer(tempNode->key,get_next,i);
+            tempNode=tempNode->next;
+        }
+    }       
 }
 
-int fileCheck(){   
-    map_thread++;
-    int file1=-1;
-    if(current_file<=fileNumber)
-    {
-        file1=current_file;
-        current_file++;
-        pthread_mutex_unlock(&filelock);   
-        return file1;
+
+
+void* callReduce(){
+    while(1){
+        pthread_mutex_lock(&filelock);
+        int x;
+        if(current_partition>=partition_number){
+            pthread_mutex_unlock(&filelock);
+            return NULL;
+        }
+        if(current_partition<partition_number){
+            x=current_partition;
+            current_partition++;
+        }
+        pthread_mutex_unlock(&filelock);
+        reduceHelper(x);
     }
-    MAPDONE=1;
-    pthread_mutex_unlock(&filelock); 
-    return file1;
+    
+    
 }
 
 void *findFile(void *files)
 {    
-    //int i=0;
     char **arguments = (char**) files;
     while(1){
         pthread_mutex_lock(&filelock);
@@ -366,16 +350,6 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, Reducer reduce,
     partition_number=num_reducers; //Number of partitions
     fileNumber=argc-1;
 
-    //Sorting the files
-    //for(int i=0;i<argc;i++)
-    //{
-       // FILE *file= fopen(argv[i], "r"); //r-->read mode.
-        //files[i].fileIndex=i+1; //argv[i] has name, i stores the index.
-        //files[i].fileSize=fileSize(file); //file size used to sort.
-        //fclose(file);
-    //}
-    //qsort(files,argc-1,sizeof(struct fd), compareFile); //Files sorted in descending order of size.
-     
     p=malloc(sizeof(struct table *)*num_reducers);
     
     for(int i=0;i<partition_number;i++){
@@ -397,36 +371,21 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, Reducer reduce,
             pthread_join(mappers[i], NULL);
         }
     
-    pthread_mutex_destroy(&filelock); //Don't need the file lock anymore
-    
-    printf("Insert done\n");
-    
-    
     partitionlock=malloc(sizeof(pthread_mutex_t)*num_reducers);    
     for(int i=0;i<num_reducers;i++){
         pthread_mutex_init(&partitionlock[i],NULL);    
     }
+    pthread_t reducer[num_reducers];
     
-
-    //pthread_t reducer[num_reducers];
-    //char* string=strdup("yourself");
-    //pthread_create(&reducer,NULL,callReduce,(void*)string);
-    
-    //pthread_join(reducer,NULL);
-    
-    //TEST
-    
-    FILE *fp = fopen(argv[1], "r");
-    char *line = NULL;
-    size_t size = 0;
-    while (getline(&line, &size, fp) != -1) {
-        char *token, *dummy = line;
-        while ((token = strsep(&dummy, " \t\n\r")) != NULL) {
-           reduce(token,get_next, num_reducers);
-        }
+    for(int i=0;i<num_reducers;i++){
+        pthread_create(&reducer[i],NULL,callReduce,NULL);
     }
-
-    fclose(fp); 
+    
+    for(int i=0;i<num_reducers;i++){
+        pthread_join(reducer[i],NULL);
+    }
        
 }    
 
+
+    
