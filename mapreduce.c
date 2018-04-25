@@ -17,10 +17,10 @@ struct table** p; //Partitions array
 Partitioner partitioner;
 Mapper mapper;
 Reducer reducer;
-int TABLE_SIZE=54;
+int TABLE_SIZE=1543;
 int partition_number;
 pthread_mutex_t filelock=PTHREAD_MUTEX_INITIALIZER;
-int fileNumber=0;
+int fileNumber;
 int current_file;
 int current_partition;
 pthread_mutex_t *partitionlock;
@@ -44,6 +44,8 @@ struct table{
     int size;
     struct node **list;
     pthread_mutex_t *locks;
+    long long nodesize;
+    pthread_mutex_t keylock;
 
 };
 
@@ -59,6 +61,8 @@ struct table *createTable(int size){
     t->size = size;
     t->list = malloc(sizeof(struct node*)*size);
     t->locks=malloc(sizeof(pthread_mutex_t)*size);
+    pthread_mutex_init(&t->keylock,NULL);
+    t->nodesize=0;
     int i;
     for(i=0;i<size;i++){
         t->list[i] = NULL;
@@ -68,30 +72,22 @@ struct table *createTable(int size){
     return t;
 }
 
-unsigned long long
-hash(char *str)
-{
-	int hash=str[0]-63;
-	if(hash>=2 && hash<=27){ //upper case alphabets
-		return hash;
-	}
-	else if(hash>=34 && hash<=59){ //lower case alphabets
-		return hash-6;
-	}
-	else if(hash<=-6 && hash>=-16){ //Numbers
-		return 1;
-	}
-	else{ //Special characters
-		return 0;
-	} 
-}
+ unsigned long long
+ hash(char *str)
+ {
+     unsigned long long hash = 5381;
+     int c;
+ 
+     while((c = *str++)!= '\0'){
+         hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+     }
+     hash=hash%TABLE_SIZE;
+     return hash;
+ }
 
 //Insert into the hash map.
-void insert(struct table *t,char* key,char* val){
-   // if(strcmp(key,"")==0)
-     //  return;
-    int pos=hash(key);
-
+void insert(struct table *t,char* key,char* val){  
+    long long pos=hash(key);
     pthread_mutex_t *lock = t->locks + pos;
     struct subnode *newSubNode=malloc(sizeof(struct subnode));
     newSubNode->val=strdup(val);
@@ -109,50 +105,40 @@ void insert(struct table *t,char* key,char* val){
             pthread_mutex_unlock(lock);
             return;
         }
-        
         temp = temp->next;
     }
+    pthread_mutex_lock(&t->keylock);
+    t->nodesize++;
+    pthread_mutex_unlock(&t->keylock);
     struct node *newNode = malloc(sizeof(struct node));
-    temp=list;
-    
-    struct node* prev=temp;
-    
-    newNode->key = strdup(key);
+    newNode->key=strdup(key);
     newNode->subnode=newSubNode;
-    newNode->current=newNode->subnode;
-    if(temp==NULL){
-        t->list[pos]= newNode;
-        newNode->next=NULL;
-        pthread_mutex_unlock(lock);
-        return;
-    }
-    else{
-        int count=0;
-        while(temp){
-           if(strcmp(temp->key,key)>0){
-                break;
-            }
-            count++;
-            prev=temp;
-            temp=temp->next;
-        }
-        
-        if(count==0){
-            newNode->next=temp;
-            t->list[pos]=newNode;
-            pthread_mutex_unlock(lock);
-            return;
-        }
-        newNode->next=temp;
-        prev->next=newNode;
-        pthread_mutex_unlock(lock);
-        return;
-    }
+    newNode->current=newNode->subnode;    
+    newNode->next = list;
+    t->list[pos] = newNode;
+    pthread_mutex_unlock(lock);
 }
 
 //////////////////////////////////////////////////////////////////////////
 // Worker
 /////////////////////////////////////////////////////////////////////////
+
+ //Method used for qsort to sort our list of keys in the hashmap.
+ int compareKey(const void *s1, const void *s2)
+ {
+     struct node **n1 = (struct node **)s1;
+     struct node **n2 = (struct node **)s2;
+     if(*n1==NULL && *n2==NULL) {
+         return 0;
+     } else if(*n1==NULL) {
+         return -1;
+     } else if(*n2==NULL) {
+         return 1;
+     } else {
+     return strcmp((*n1)->key,(*n2)->key);
+     }
+ }
+
 
 //Getter function that returns the next key in a subnode list.
 char* get_next(char* key, int partition_num)
@@ -179,18 +165,26 @@ void reduceHelper(int i){
     if(p[i]==NULL)
         return;
     struct table* tempTable=p[i];
+    struct node *list[p[i]->nodesize];
+    long long x=0;
     for(int j=0;j<TABLE_SIZE;j++){
         if(tempTable->list[j] ==NULL)
             continue;
         struct node* tempNode=tempTable->list[j];
         while(tempNode){
-	    reducenode[i]=tempNode;
-	    reducer(tempNode->key,get_next,i);
+            list[x]=tempNode;
+            x++;
             tempNode=tempNode->next;
         }
-    }       
+    }
+    qsort(list,p[i]->nodesize,sizeof(struct node *),compareKey);
+    for(int k=0;k<x;k++){
+        reducenode[i]=list[k];
+        reducer(list[k]->key,get_next,i);
+    }
 }
-
+        
+         
 void* callReduce(){
     while(1){
         pthread_mutex_lock(&filelock);
@@ -204,7 +198,7 @@ void* callReduce(){
             current_partition++;
         }
         pthread_mutex_unlock(&filelock);
-	reduceHelper(x);
+	    reduceHelper(x);
     }    
 }
 
@@ -256,6 +250,38 @@ void MR_Emit(char *key, char *value){ //Key -> tocket, Value -> 1
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// Memory Cleanup
+////////////////////////////////////////////////////////////////////////////
+
+void freeTable(struct table *t)
+{
+    for(int i=0;i<t->size;i++)
+    {
+	    struct node *list1=t->list[i];
+        struct node *temp2=list1;
+        pthread_mutex_t *l=&(t->locks[i]);
+        while(temp2)
+        { 	
+            struct node *tempNode=temp2;
+            struct subnode *temp=tempNode->subnode;
+            while(temp){
+                struct subnode *sublist=temp;
+                temp=temp->next; 
+		        free(sublist->val);	
+                free(sublist);
+            }
+            temp2=temp2->next;
+		    free(tempNode->key);
+            free(tempNode); 
+	    }
+	    pthread_mutex_destroy(l);
+    }
+    free(t->locks);
+    free(t->list);
+    free(t);
+}
+
+////////////////////////////////////////////////////////////////////////////
 /* Main */
 ///////////////////////////////////////////////////////////////////////////
 
@@ -280,20 +306,15 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, Reducer reduce,
     
     //Start Mapping Process
     pthread_t mappers[num_mappers];
-       
-        for(int i=0;i<num_mappers;i++){
-            pthread_create(&mappers[i], NULL,findFile,(void*) argv);
-        } 
-     
+    for(int i=0;i<num_mappers || i==argc-1;i++){
+         pthread_create(&mappers[i], NULL,findFile,(void*) argv);
+    } 
     //Join the Mappers       
-    for(int i=0;i<num_mappers;i++)//Start joining all the threads
-        {
-            //printf("Joining\n");
-            if(i==argc-1)
-                break;
+    for(int i=0;i<num_mappers || i==argc-1;i++)//Start joining all the threads
+    {
             pthread_join(mappers[i], NULL);
-        }
-    
+    }
+
     //Start Reducing Process
     pthread_t reducer[num_reducers];
     reducenode=malloc(sizeof(struct node *) * num_reducers);
@@ -304,5 +325,15 @@ void MR_Run(int argc, char *argv[], Mapper map, int num_mappers, Reducer reduce,
     //Join the Reducers
     for(int i=0;i<num_reducers;i++){
         pthread_join(reducer[i],NULL);
-    }       
+    }
+    
+    //Memory clean-up
+    for(int i=0;i<partition_number;i++)
+	{	
+  	 	freeTable(p[i]);
+	}
+    free(partitionlock);
+    free(reducenode);
+    free(p);
 }    
+    
